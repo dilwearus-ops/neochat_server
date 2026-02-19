@@ -11,7 +11,6 @@ import secrets
 import threading
 from datetime import datetime, timedelta
 from collections import defaultdict
-from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 # --- КОНФИГУРАЦИЯ ---
 DB_NAME = "chat_v10_ultimate.db"
@@ -47,11 +46,9 @@ class Database:
         # 2. Комнаты
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS rooms (
-                id TEXT PRIMARY KEY,
-                name TEXT UNIQUE,
+                name TEXT PRIMARY KEY,
                 creator TEXT,
                 type TEXT,
-                avatar TEXT,
                 pinned_msg_id INTEGER,
                 created_at REAL
             )
@@ -59,10 +56,9 @@ class Database:
         # 3. Баны
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS bans (
-                room_id TEXT,
+                room_name TEXT,
                 username TEXT,
-                PRIMARY KEY (room_id, username),
-                FOREIGN KEY (room_id) REFERENCES rooms(id)
+                PRIMARY KEY (room_name, username)
             )
         ''')
         # 4. Сообщения
@@ -116,22 +112,20 @@ class Database:
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS invite_codes (
                 code TEXT PRIMARY KEY,
-                room_id TEXT,
+                room_name TEXT,
                 creator TEXT,
                 created_at REAL,
-                expires_at REAL,
-                FOREIGN KEY (room_id) REFERENCES rooms(id)
+                expires_at REAL
             )
         ''')
         # 9. Члены групп с ролями
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS room_members (
-                room_id TEXT,
+                room_name TEXT,
                 username TEXT,
                 role TEXT DEFAULT 'member',
                 joined_at REAL,
-                PRIMARY KEY (room_id, username),
-                FOREIGN KEY (room_id) REFERENCES rooms(id)
+                PRIMARY KEY (room_name, username)
             )
         ''')
         # 10. Удаленные сообщения (для администраторов)
@@ -213,157 +207,62 @@ class Database:
     # --- ROOMS & MEMBERS ---
     def create_room(self, name, creator, rtype):
         try:
-            # Генерируем ID как @название (но в нижнем регистре без пробелов)
-            room_id = "@" + name.lower().replace(" ", "")
             self.cursor.execute(
-                "INSERT INTO rooms (id, name, creator, type, created_at) VALUES (?, ?, ?, ?, ?)", 
-                (room_id, name, creator, rtype, time.time())
+                "INSERT INTO rooms (name, creator, type, created_at) VALUES (?, ?, ?, ?)", 
+                (name, creator, rtype, time.time())
             )
             self.cursor.execute(
-                "INSERT INTO room_members (room_id, username, role, joined_at) VALUES (?, ?, ?, ?)",
-                (room_id, creator, "admin", time.time())
+                "INSERT INTO room_members (room_name, username, role, joined_at) VALUES (?, ?, ?, ?)",
+                (name, creator, "admin", time.time())
             )
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
             return False
 
-    def get_rooms(self, username=None):
-        """Get rooms where user is a member. If username is None, return all rooms."""
-        if username:
-            self.cursor.execute("""
-                SELECT r.* FROM rooms r
-                INNER JOIN room_members rm ON r.id = rm.room_id
-                WHERE rm.username = ?
-                ORDER BY r.created_at DESC
-            """, (username,))
-        else:
-            self.cursor.execute("SELECT * FROM rooms ORDER BY created_at DESC")
-        
-        rooms = [dict(row) for row in self.cursor.fetchall()]
-        # Add member count to each room
-        for room in rooms:
-            self.cursor.execute("SELECT COUNT(*) as count FROM room_members WHERE room_id=?", (room['id'],))
-            room['member_count'] = self.cursor.fetchone()['count']
-        return rooms
-
-    def get_room_info(self, room_id):
-        # Попытаемся найти по ID сначала, потом по имени (для обратной совместимости)
-        self.cursor.execute("SELECT * FROM rooms WHERE id=?", (room_id,))
-        row = self.cursor.fetchone()
-        if not row:
-            self.cursor.execute("SELECT * FROM rooms WHERE name=?", (room_id,))
-            row = self.cursor.fetchone()
-        return dict(row) if row else None
-
-    def get_room_members(self, room_id):
-        self.cursor.execute(
-            "SELECT username, role, joined_at FROM room_members WHERE room_id=? ORDER BY joined_at ASC", 
-            (room_id,)
-        )
-        members = [dict(row) for row in self.cursor.fetchall()]
-        # Get avatar for each member
-        for member in members:
-            user = self.get_user_info(member['username'])
-            if user:
-                member['avatar'] = user.get('avatar')
-        return members
-
-    def search_rooms(self, query):
-        """Search rooms by ID (starts with @) or name"""
-        if query.startswith('@'):
-            # Search by ID
-            query = query[1:]  # Remove @
-            self.cursor.execute("SELECT * FROM rooms WHERE id LIKE ? ORDER BY created_at DESC", (f'@{query}%',))
-        else:
-            # Search by name
-            self.cursor.execute("SELECT * FROM rooms WHERE name LIKE ? ORDER BY created_at DESC", (f'%{query}%',))
-        
-        rooms = [dict(row) for row in self.cursor.fetchall()]
-        # Add member count
-        for room in rooms:
-            self.cursor.execute("SELECT COUNT(*) as count FROM room_members WHERE room_id=?", (room['id'],))
-            room['member_count'] = self.cursor.fetchone()['count']
-        return rooms
-
-    def join_room(self, room_id, username):
-        """Add user to room if not already member"""
-        try:
-            self.cursor.execute(
-                "INSERT INTO room_members (room_id, username, role, joined_at) VALUES (?, ?, ?, ?)",
-                (room_id, username, "member", time.time())
-            )
-            self.conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-    def search_users(self, query, exclude_username=None):
-        """Search users by username, optionally excluding current user"""
-        if exclude_username:
-            self.cursor.execute(
-                "SELECT username, avatar, bio, user_status FROM users WHERE username LIKE ? AND username != ? LIMIT 20", 
-                (f'%{query}%', exclude_username)
-            )
-        else:
-            self.cursor.execute(
-                "SELECT username, avatar, bio, user_status FROM users WHERE username LIKE ? LIMIT 20", 
-                (f'%{query}%',)
-            )
+    def get_rooms(self):
+        self.cursor.execute("SELECT * FROM rooms ORDER BY created_at DESC")
         return [dict(row) for row in self.cursor.fetchall()]
 
-    def get_recent_contacts(self, username, limit=15):
-        """Get recent contacts from message history"""
-        # Find unique users from recent PM conversations (target is the other user for PMs)
-        self.cursor.execute("""
-            SELECT DISTINCT CASE 
-                WHEN sender = ? THEN target 
-                ELSE sender 
-            END as contact_user
-            FROM messages 
-            WHERE context = 'pm' AND (sender = ? OR target = ?)
-            ORDER BY timestamp DESC 
-            LIMIT ?
-        """, (username, username, username, limit))
-        
-        contacts = []
-        seen = set()
-        for row in self.cursor.fetchall():
-            contact_name = row['contact_user']
-            if contact_name and contact_name not in seen:
-                seen.add(contact_name)
-                user = self.get_user_info(contact_name)
-                if user:
-                    contacts.append(user)
-        return contacts
+    def get_room_info(self, name):
+        self.cursor.execute("SELECT * FROM rooms WHERE name=?", (name,))
+        row = self.cursor.fetchone()
+        return dict(row) if row else None
 
-    def add_room_member(self, room_id, username, role='member'):
+    def get_room_members(self, room_name):
+        self.cursor.execute(
+            "SELECT username, role FROM room_members WHERE room_name=?", 
+            (room_name,)
+        )
+        return [dict(row) for row in self.cursor.fetchall()]
+
+    def add_room_member(self, room_name, username, role='member'):
         try:
             self.cursor.execute(
-                "INSERT INTO room_members (room_id, username, role, joined_at) VALUES (?, ?, ?, ?)",
-                (room_id, username, role, time.time())
+                "INSERT INTO room_members (room_name, username, role, joined_at) VALUES (?, ?, ?, ?)",
+                (room_name, username, role, time.time())
             )
             self.conn.commit()
             return True
         except:
             return False
 
-    def get_user_role(self, room_id, username):
+    def get_user_role(self, room_name, username):
         self.cursor.execute(
-            "SELECT role FROM room_members WHERE room_id=? AND username=?",
-            (room_id, username)
+            "SELECT role FROM room_members WHERE room_name=? AND username=?",
+            (room_name, username)
         )
         row = self.cursor.fetchone()
         return row['role'] if row else None
 
     # --- INVITE CODES ---
-    def create_invite_code(self, room_id, creator, hours=24):
+    def create_invite_code(self, room_name, creator, hours=24):
         code = secrets.token_urlsafe(8)
         expires_at = time.time() + (hours * 3600)
         try:
             self.cursor.execute(
-                "INSERT INTO invite_codes (code, room_id, creator, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-                (code, room_id, creator, time.time(), expires_at)
+                "INSERT INTO invite_codes (code, room_name, creator, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                (code, room_name, creator, time.time(), expires_at)
             )
             self.conn.commit()
             return code
@@ -372,7 +271,7 @@ class Database:
 
     def use_invite_code(self, code, username):
         self.cursor.execute(
-            "SELECT room_id, expires_at FROM invite_codes WHERE code=?", 
+            "SELECT room_name, expires_at FROM invite_codes WHERE code=?", 
             (code,)
         )
         row = self.cursor.fetchone()
@@ -382,9 +281,9 @@ class Database:
         if row['expires_at'] < time.time():
             return None, "Код истёк"
         
-        room_id = row['room_id']
-        if self.add_room_member(room_id, username):
-            return room_id, "OK"
+        room_name = row['room_name']
+        if self.add_room_member(room_name, username):
+            return room_name, "OK"
         return None, "Ошибка добавления в группу"
 
     # --- MESSAGES & SEARCH ---
@@ -596,33 +495,33 @@ class Database:
             result[emoji].append(row['sender'])
         return result
 
-    def pin_message(self, room_id, msg_id):
-        self.cursor.execute("UPDATE rooms SET pinned_msg_id=? WHERE id=?", (msg_id, room_id))
+    def pin_message(self, room_name, msg_id):
+        self.cursor.execute("UPDATE rooms SET pinned_msg_id=? WHERE name=?", (msg_id, room_name))
         self.conn.commit()
 
-    def ban_user(self, room_id, username):
+    def ban_user(self, room_name, username):
         try:
             self.cursor.execute(
-                "INSERT INTO bans (room_id, username) VALUES (?, ?)", 
-                (room_id, username)
+                "INSERT INTO bans (room_name, username) VALUES (?, ?)", 
+                (room_name, username)
             )
             self.conn.commit()
         except:
             pass
 
-    def is_banned(self, room_id, username):
+    def is_banned(self, room_name, username):
         self.cursor.execute(
-            "SELECT 1 FROM bans WHERE room_id=? AND username=?", 
-            (room_id, username)
+            "SELECT 1 FROM bans WHERE room_name=? AND username=?", 
+            (room_name, username)
         )
         return self.cursor.fetchone() is not None
 
-    def get_deleted_message_log(self, room_id):
+    def get_deleted_message_log(self, room_name):
         self.cursor.execute(
             """SELECT dm.*, m.text FROM deleted_messages dm 
                LEFT JOIN messages m ON dm.message_id = m.id 
                WHERE EXISTS(SELECT 1 FROM messages WHERE id=dm.message_id AND target=?)""",
-            (room_id,)
+            (room_name,)
         )
         return [dict(row) for row in self.cursor.fetchall()]
 
@@ -762,7 +661,7 @@ class ChatServer:
             else:
                 return
 
-            await websocket.send(json.dumps({"type": "rooms_list", "rooms": self.db.get_rooms(nick)}))
+            await websocket.send(json.dumps({"type": "rooms_list", "rooms": self.db.get_rooms()}))
             await self.broadcast_presence()
 
             # MAIN LOOP
@@ -792,11 +691,6 @@ class ChatServer:
                             "type": "error", 
                             "text": "Сообщение содержит недопустимый контент"
                         }))
-                        continue
-                    
-                    # Проверка: нельзя писать самому себе
-                    if 'recipient' in data and data['recipient'] == nick:
-                        await websocket.send(json.dumps({"type": "error", "text": "Нельзя писать сообщения самому себе"}))
                         continue
                     
                     if 'room_name' in data and self.db.is_banned(data['room_name'], nick):
@@ -1007,89 +901,7 @@ class ChatServer:
 
                 elif mtype == "create_room":
                     if self.db.create_room(html.escape(data['name']), nick, data['rtype']):
-                        # Send updated rooms list only to the user who created the room
-                        await websocket.send(json.dumps({"type": "rooms_list", "rooms": self.db.get_rooms(nick)}))
-
-                elif mtype == "search_rooms":
-                    query = data.get('query', '').strip()
-                    if query:
-                        results = self.db.search_rooms(query)
-                        # Check which ones user is already member of
-                        for room in results:
-                            is_member = self.db.cursor.execute(
-                                "SELECT 1 FROM room_members WHERE room_id=? AND username=?",
-                                (room['id'], nick)
-                            ).fetchone() is not None
-                            room['is_member'] = is_member
-                        await websocket.send(json.dumps({"type": "search_results", "results": results}))
-
-                elif mtype == "join_room":
-                    room_id = data.get('room_id')
-                    if self.db.join_room(room_id, nick):
-                        # Send confirmation and updated rooms list
-                        await websocket.send(json.dumps({
-                            "type": "room_joined",
-                            "room_id": room_id,
-                            "message": "Вы присоединились к группе"
-                        }))
-                        await websocket.send(json.dumps({
-                            "type": "rooms_list",
-                            "rooms": self.db.get_rooms(nick)
-                        }))
-                    else:
-                        await websocket.send(json.dumps({
-                            "type": "error",
-                            "text": "Не удалось присоединиться к группе"
-                        }))
-
-                elif mtype == "search_users":
-                    query = data.get('query', '').strip()
-                    if query:
-                        # Исключаем текущего пользователя из результатов
-                        results = self.db.search_users(query, exclude_username=nick)
-                        await websocket.send(json.dumps({"type": "search_users_results", "results": results}))
-
-                elif mtype == "get_recent_contacts":
-                    contacts = self.db.get_recent_contacts(nick)
-                    await websocket.send(json.dumps({"type": "recent_contacts", "contacts": contacts}))
-
-                elif mtype == "rename_room":
-                    role = self.db.get_user_role(data['room_name'], nick)
-                    if role in ['admin']:
-                        # Обновляем только название, ID остаётся прежним
-                        self.db.cursor.execute("UPDATE rooms SET name=? WHERE id=?", 
-                                              (data['new_name'], data['room_name']))
-                        self.db.conn.commit()
-                        # Send updated rooms list to all connected clients
-                        for client_nick in self.clients:
-                            await self.clients[client_nick].send(json.dumps({
-                                "type": "rooms_list",
-                                "rooms": self.db.get_rooms(client_nick)
-                            }))
-                elif mtype == "update_room_avatar":
-                    role = self.db.get_user_role(data['room_name'], nick)
-                    if role in ['admin']:
-                        # Сохраняем аватар в БД
-                        self.db.cursor.execute("UPDATE rooms SET avatar=? WHERE id=?", 
-                                              (data['avatar'], data['room_name']))
-                        self.db.conn.commit()
-                        # Send updated rooms list to all connected clients
-                        for client_nick in self.clients:
-                            await self.clients[client_nick].send(json.dumps({
-                                "type": "rooms_list",
-                                "rooms": self.db.get_rooms(client_nick)
-                            }))
-
-                elif mtype == "change_member_role":
-                    role = self.db.get_user_role(data['room_name'], nick)
-                    if role in ['admin']:
-                        self.db.cursor.execute("UPDATE room_members SET role=? WHERE room_id=? AND username=?",
-                                              (data['role'], data['room_name'], data['username']))
-                        self.db.conn.commit()
-                        await self.broadcast({
-                            "type": "info",
-                            "text": f"Роль {data['username']} в группе {data['room_name']} изменена на {data['role']}"
-                        })
+                        await self.broadcast({"type": "rooms_list", "rooms": self.db.get_rooms()})
 
                 elif mtype == "history_req":
                     context = data['context']
@@ -1099,13 +911,6 @@ class ChatServer:
                         await self.send_to_user(target, {"type": "msgs_read_by_user", "reader": nick})
                     hist = self.db.get_history(context, target, nick)
                     room_info = self.db.get_room_info(target) if context == 'room' else None
-                    
-                    # Добавить информацию о членах группы и количество участников
-                    if room_info:
-                        members = self.db.get_room_members(target)
-                        room_info['members'] = members
-                        room_info['member_count'] = len(members)
-                    
                     pinned = None
                     if room_info and room_info['pinned_msg_id']:
                         pinned = self.db.get_message(room_info['pinned_msg_id'])
@@ -1128,29 +933,10 @@ class ChatServer:
 
 async def main(host, port):
     server = ChatServer()
-    print(f"🚀 NEOCHAT SERVER V10 ULTIMATE WebSocket running on {host}:{port}")
-    
-    # Запускаем WebSocket сервер на выделенном PORT
-    # На локальной машине для HTTP файлов запустите отдельно:
-    # python -m http.server 5001 (в папке проекта)
-    try:
-        async with websockets.serve(server.handler, host, port, max_size=MAX_MEDIA_SIZE):
-            print(f"✅ Server successfully started on ws://{host}:{port}")
-            await asyncio.Future()
-    except Exception as e:
-        print(f"❌ Error starting server: {e}")
-        raise
+    print(f"🚀 NEOCHAT SERVER V10 ULTIMATE running on {host}:{port}")
+    async with websockets.serve(server.handler, host, port, max_size=MAX_MEDIA_SIZE):
+        await asyncio.Future()
 
 if __name__ == "__main__":
-    # Render выставляет PORT в переменную окружения
-    port = int(os.environ.get("PORT", "5001"))
-    print(f"🔧 Starting on port: {port}")
-    print(f"📝 DATABASE: {DB_NAME}")
-    try:
-        asyncio.run(main("0.0.0.0", port))
-    except KeyboardInterrupt:
-        print("\n🛑 Server shutdown")
-    except Exception as e:
-        print(f"💥 Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
+    port = int(os.environ.get("PORT", 5001))
+    asyncio.run(main("0.0.0.0", port))

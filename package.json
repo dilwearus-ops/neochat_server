@@ -1,0 +1,13 @@
+{
+  "name": "neochat",
+  "version": "10.1.0",
+  "description": "NeoChat Messenger",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "http-proxy": "^1.18.1"
+  }
+}

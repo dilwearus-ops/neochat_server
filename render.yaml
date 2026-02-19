@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: neochat-server
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python websocket_server.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: 1
